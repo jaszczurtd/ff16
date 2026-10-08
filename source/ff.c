@@ -3594,6 +3594,7 @@ static FRESULT mount_volume (	/* FR_OK(0): successful, !=0: an error occurred */
 
 		fs->n_fats = fs->win[BPB_NumFATs];				/* Number of FATs */
 		if (fs->n_fats != 1 && fs->n_fats != 2) return FR_NO_FILESYSTEM;	/* (Must be 1 or 2) */
+		if (fasize == 0 || fasize > (DWORD)0xFFFFFFFF / fs->n_fats) return FR_NO_FILESYSTEM;	/* Reject overflowing FAT area */
 		fasize *= fs->n_fats;							/* Number of sectors for FAT area */
 
 		fs->csize = fs->win[BPB_SecPerClus];			/* Cluster size */
@@ -3609,8 +3610,9 @@ static FRESULT mount_volume (	/* FR_OK(0): successful, !=0: an error occurred */
 		if (nrsv == 0) return FR_NO_FILESYSTEM;			/* (Must not be 0) */
 
 		/* Determine the FAT sub type */
-		sysect = nrsv + fasize + fs->n_rootdir / (SS(fs) / SZDIRE);	/* RSV + FAT + DIR */
-		if (tsect < sysect) return FR_NO_FILESYSTEM;	/* (Invalid volume size) */
+		sysect = (DWORD)nrsv + fs->n_rootdir / (SS(fs) / SZDIRE);	/* RSV + DIR */
+		if (tsect <= sysect || fasize >= tsect - sysect) return FR_NO_FILESYSTEM;	/* Reject overflowing or oversized system area */
+		sysect += fasize;								/* RSV + FAT + DIR */
 		nclst = (tsect - sysect) / fs->csize;			/* Number of clusters */
 		if (nclst == 0) return FR_NO_FILESYSTEM;		/* (Invalid volume size) */
 		fmt = 0;
@@ -4549,10 +4551,10 @@ FRESULT f_getcwd (
 
 #if FF_FS_MINIMIZE <= 2
 /*-----------------------------------------------------------------------*/
-/* API: Seek File Read/Write Pointer                                     */
+/* Move File Read/Write Pointer                                          */
 /*-----------------------------------------------------------------------*/
 
-FRESULT f_lseek (
+static FRESULT seek_file (
 	FIL* fp,		/* Pointer to the file object */
 	FSIZE_t ofs		/* File pointer from top of file */
 )
@@ -4707,6 +4709,44 @@ FRESULT f_lseek (
 	}
 
 	LEAVE_FF(fs, res);
+}
+
+
+
+/*-----------------------------------------------------------------------*/
+/* API: Seek File Read/Write Pointer                                     */
+/*-----------------------------------------------------------------------*/
+
+FRESULT f_lseek (
+	FIL* fp,		/* Pointer to the file object */
+	FSIZE_t ofs		/* File pointer from top of file */
+)
+{
+#if !FF_FS_READONLY
+	/* Writes smaller than a sector go through the sector cache, so the disk
+	   driver never reads this constant directly. */
+	static const BYTE zeros[64] = {0};
+	FRESULT res;
+	UINT n, bw;
+
+	/* Extending in write mode: zero-fill from the end of file instead of
+	   exposing stale cluster data (CVE-2026-6686). Fast seek mode does not
+	   extend files. */
+	if (fp && fp->obj.fs && (fp->flag & FA_WRITE) && ofs > fp->obj.objsize
+#if FF_USE_FASTSEEK
+		&& !fp->cltbl
+#endif
+	) {
+		res = seek_file(fp, fp->obj.objsize);
+		while (res == FR_OK && fp->fptr < ofs) {
+			n = (ofs - fp->fptr > sizeof zeros) ? (UINT)sizeof zeros : (UINT)(ofs - fp->fptr);
+			res = f_write(fp, zeros, n, &bw);
+			if (bw < n) break;	/* Disk full or file size limit: the file ends here */
+		}
+		return res;
+	}
+#endif
+	return seek_file(fp, ofs);
 }
 
 
